@@ -43,7 +43,19 @@ func New(ctx context.Context, discovery *kubediscovery.Client, promRegistry *pro
 		[]string{"type"},
 	)
 
-	promRegistry.MustRegister(errorCounter, durationSummary)
+	// TODO: Add label for which request it was as this is not helpful in this current state
+	// TODO: Do we want to have it also as summary?
+	latencyVec := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "httpclient_trace_request_duration_seconds",
+			Help:      "Latency histogram for requests from the kubenurse http client. Time in seconds since the start of the http request.",
+			Buckets:   []float64{.0005, .005, .01, .025, .05, .1, .25, .5, 1}, // TODO: Which buckets are really needed?
+		},
+		[]string{"event", "type"},
+	)
+
+	promRegistry.MustRegister(errorCounter, durationSummary, latencyVec)
 
 	// setup http transport
 	transport, err := generateRoundTripper(os.Getenv("KUBENURSE_EXTRA_CA"), os.Getenv("KUBENURSE_INSECURE") == "true")
@@ -55,7 +67,7 @@ func New(ctx context.Context, discovery *kubediscovery.Client, promRegistry *pro
 
 	httpClient := &http.Client{
 		Timeout:   5 * time.Second,
-		Transport: withRequestTracing(promRegistry, transport),
+		Transport: withHttptrace(promRegistry, transport, latencyVec),
 	}
 
 	return &Checker{
@@ -139,25 +151,25 @@ func (c *Checker) StopScheduled() {
 }
 
 // APIServerDirect checks the /version endpoint of the Kubernetes API Server through the direct link
-func (c *Checker) APIServerDirect() (string, error) {
+func (c *Checker) APIServerDirect(ctx context.Context) (string, error) {
 	apiurl := fmt.Sprintf("https://%s:%s/version", c.KubernetesServiceHost, c.KubernetesServicePort)
-	return c.doRequest(apiurl)
+	return c.doRequest(ctx, apiurl)
 }
 
 // APIServerDNS checks the /version endpoint of the Kubernetes API Server through the Cluster DNS URL
-func (c *Checker) APIServerDNS() (string, error) {
+func (c *Checker) APIServerDNS(ctx context.Context) (string, error) {
 	apiurl := fmt.Sprintf("https://kubernetes.default.svc.cluster.local:%s/version", c.KubernetesServicePort)
-	return c.doRequest(apiurl)
+	return c.doRequest(ctx, apiurl)
 }
 
 // MeIngress checks if the kubenurse is reachable at the /alwayshappy endpoint behind the ingress
-func (c *Checker) MeIngress() (string, error) {
-	return c.doRequest(c.KubenurseIngressURL + "/alwayshappy")
+func (c *Checker) MeIngress(ctx context.Context) (string, error) {
+	return c.doRequest(ctx, c.KubenurseIngressURL+"/alwayshappy")
 }
 
 // MeService checks if the kubenurse is reachable at the /alwayshappy endpoint through the kubernetes service
-func (c *Checker) MeService() (string, error) {
-	return c.doRequest(c.KubenurseServiceURL + "/alwayshappy")
+func (c *Checker) MeService(ctx context.Context) (string, error) {
+	return c.doRequest(ctx, c.KubenurseServiceURL+"/alwayshappy")
 }
 
 // checkNeighbours checks the /alwayshappy endpoint from every discovered kubenurse neighbour. Neighbour pods on nodes
@@ -166,12 +178,12 @@ func (c *Checker) checkNeighbours(nh []kubediscovery.Neighbour) {
 	for _, neighbour := range nh {
 		neighbour := neighbour // pin
 		if c.allowUnschedulable || neighbour.NodeSchedulable == kubediscovery.NodeSchedulable {
-			check := func() (string, error) {
+			check := func(ctx context.Context) (string, error) {
 				if c.UseTLS {
-					return c.doRequest("https://" + neighbour.PodIP + ":8443/alwayshappy")
+					return c.doRequest(ctx, "https://"+neighbour.PodIP+":8443/alwayshappy")
 				}
 
-				return c.doRequest("http://" + neighbour.PodIP + ":8080/alwayshappy")
+				return c.doRequest(ctx, "http://"+neighbour.PodIP+":8080/alwayshappy")
 			}
 
 			_, _ = c.measure(check, "path_"+neighbour.NodeName)
@@ -183,8 +195,12 @@ func (c *Checker) checkNeighbours(nh []kubediscovery.Neighbour) {
 func (c *Checker) measure(check Check, label string) (string, error) {
 	start := time.Now()
 
+	// Add our label (check type) to the context so our http tracer can annotate
+	// metrics and errors based with the label
+	ctx := context.WithValue(context.Background(), kubenurseContextKey{}, label)
+
 	// Execute check
-	res, err := check()
+	res, err := check(ctx)
 
 	// Process metrics
 	c.durationSummary.WithLabelValues(label).Observe(time.Since(start).Seconds())
